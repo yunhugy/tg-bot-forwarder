@@ -1,121 +1,96 @@
-# Telegram 匿名双向传话 Bot
+# Telegram 匿名双向传话 Bot（Vercel）
 
-一个部署在 Vercel/Cloudflare Workers 的无服务器 Telegram Bot，实现用户 ↔ Bot ↔ 管理员的双向匿名传话。
+用户私聊 Bot → 转发给管理员（你）→ 你回复后原路回传给用户。  
+支持文本、图片、视频、文件、音频、语音、贴纸。
 
-## ✨ 功能特性
+## 当前可用配置（本项目）
 
-- **匿名传话**：用户发消息给 Bot，转发给管理员（你）
-- **双向回复**：管理员回复 Bot，消息原路传回给用户
-- **多格式支持**：文字、图片、视频、文件、贴纸
-- **无服务器**：部署到 Vercel，24小时在线，无需自建服务器
-- **对话管理**：管理员可查看所有活跃对话
-- **按钮操作**：一键回复，便捷操作
+- Bot：`@markgetbot`
+- 管理员 ID：`6609386680`
+- 部署平台：Vercel Serverless
+- Webhook 路径：`/api/index.js`
 
-## 📸 界面预览
+---
 
+## 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `TG_BOT_TOKEN` | BotFather 提供的 Token（不要带 `bot` 前缀） |
+| `ADMIN_ID` | 管理员用户 ID（本项目为 `6609386680`） |
+| `ECHO_MODE` | `true/false`，用户发消息后是否自动回执 |
+
+---
+
+## 一次性初始化 Webhook（重要）
+
+部署后，打开：
+
+`https://你的域名/api/index.js?setup=1`
+
+返回 `"Webhook was set"` 即成功。
+
+> 本项目已内置 setup 逻辑，会自动把 webhook 绑定到正确路径 `/api/index.js`。
+
+---
+
+## 使用方法
+
+### 用户侧
+直接给 Bot 发消息即可。
+
+### 管理员侧
+
+- `/start` 或 `/help`：查看管理员用法
+- `/id`：查看管理员 ID
+- `/reply_<用户ID> 内容`：指定回复用户
+- 或直接回复“Bot 转发来的那条用户消息”
+
+---
+
+## 功能说明
+
+### 1) 用户 -> 管理员
+- 用户发文本/媒体给 Bot
+- Bot 转发给管理员，并附带 `[UID:xxx]`
+
+### 2) 管理员 -> 用户
+- 管理员回复转发消息（或 `/reply_xxx`）
+- Bot 原路转发回对应用户
+
+### 3) 媒体支持
+- 文本
+- 图片（photo）
+- 视频（video）
+- 文件（document）
+- 音频（audio）
+- 语音（voice）
+- 贴纸（sticker）
+
+---
+
+## 故障排查（最常见）
+
+### A. setup 返回 401 Unauthorized
+`TG_BOT_TOKEN` 无效或格式错误。请重新粘贴 BotFather token。
+
+### B. 发消息不回
+1. 先访问 `.../api/index.js?setup=1` 重新绑 webhook
+2. 确认返回 `ok: true`
+3. 再发 `test`
+
+### C. 管理员发消息没反应
+管理员消息需要：
+- 回复某条用户转发消息，或
+- 使用 `/reply_用户ID 内容`
+
+---
+
+## 项目结构
+
+```text
+api/index.js     # 主逻辑（生产）
+vercel.json      # Vercel 路由
+package.json     # 项目配置
+README.md        # 本文档
 ```
-用户 → Bot → 管理员(你)
-       ↑         ↓
-用户 ← Bot ← 管理员(你)
-```
-
-## 🚀 快速部署
-
-### 1. 获取 Telegram Bot Token
-1. 在 Telegram 中搜索 @BotFather
-2. 发送 `/newbot` 创建新机器人
-3. 获取 **Bot Token**（形如 `123456:ABC-DEF1234ghIkl-z...`）
-
-### 2. 获取你的用户 ID
-1. 在 Telegram 中搜索 @userinfobot
-2. 发送 `/start`
-3. 获取 **Id**（一串数字）
-
-### 3. 部署到 Vercel
-
-**Vercel 一键部署**：
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/your-repo/tg-bot-forwarder)
-
-或者手动部署：
-```bash
-npm i -g vercel
-cd /var/minis/workspace/tg-bot-forwarder
-vercel --prod
-```
-
-### 4. 配置环境变量
-在 Vercel Project → Settings → Environment Variables：
-
-| 变量 | 值 |
-|------|-----|
-| `TG_BOT_TOKEN` | 你的 Bot Token |
-| `ADMIN_ID` | 你的用户 ID |
-| `ECHO_MODE` | `true`（可选，自动回复用户） |
-
-### 5. 设置 Webhook
-替换以下链接中的 `<TOKEN>` 和 `<DOMAIN>`：
-```bash
-curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook?url=https://<PROJECT>.vercel.app/"
-```
-
-## 🎯 使用方法
-
-### 用户端
-1. 搜索你的 Bot，开始对话
-2. 发送任何消息（文字/图片/文件）
-3. 收到回复
-
-### 管理员端 (你)
-1. **查看对话**：给 Bot 发送 `/list`
-2. **回复用户**：
-   - 方式1：点击消息下方的"↩️ 回复"按钮
-   - 方式2：发送 `/reply_<用户ID> 你的消息`
-   - 方式3：直接回复 Bot 转发的用户消息
-3. **支持媒体**：发送图片/视频/文件给 Bot，会转发给用户
-
-## ⚙️ 本地开发
-
-```bash
-# 克隆项目
-git clone https://github.com/your-repo/tg-bot-forwarder
-
-# 安装依赖
-npm install
-
-# 设置环境变量
-cp .env.example .env
-# 编辑 .env 文件
-
-# 本地运行
-npm run dev
-```
-
-## 📁 文件结构
-
-```
-├── api/index.js          # Bot 核心逻辑 (Vercel serverless)
-├── package.json         # 依赖配置
-├── vercel.json         # Vercel 部署配置
-├── .env.example        # 环境变量模板
-└── README.md
-```
-
-## ❓ 常见问题
-
-**Q：如何获取用户 ID？**
-A：使用 @userinfobot 获取，或者用户在对话时 Bot 会显示 ID。
-
-**Q：Webhook 总是失败？**
-A：检查域名 HTTPS、Vercel 是否部署成功、Bot Token 是否正确。
-
-**Q：如何清空对话历史？**
-A：重启 Bot（重启 Vercel 函数）或等待内存自然清理。
-
-## 📄 License
-
-MIT
-
-## 🔗 相关资源
-- [Telegram Bot API](https://core.telegram.org/bots/api)
-- [node-telegram-bot-api](https://github.com/yagop/node-telegram-bot-api)
-- [Vercel Serverless Functions](https://vercel.com/docs/functions)
