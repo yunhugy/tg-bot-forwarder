@@ -1,31 +1,37 @@
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
 
-  if (req.method !== 'POST') {
-    return res.status(200).json({ ok: true, name: 'TG Anonymous Messenger' });
-  }
-
-  const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+  const token = (process.env.TG_BOT_TOKEN || '').trim().replace(/^bot/i, '');
   const ADMIN_ID = Number(process.env.ADMIN_ID || '6609386680');
   const ECHO_MODE = process.env.ECHO_MODE !== 'false';
 
-  if (!BOT_TOKEN) {
-    return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN not set' });
-  }
+  if (!token) return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN not set' });
 
-  const api = (method, body) => fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+  const api = (method, body) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   }).then(r => r.json());
 
-  const esc = (s = '') => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  const nameOf = (u) => [u?.first_name, u?.last_name].filter(Boolean).join(' ') || u?.username || `用户${u?.id || ''}`;
-  const tagOf = (msg) => {
-    const text = msg?.text || msg?.caption || '';
-    const m = text.match(/\[UID:(\d+)\]/);
-    return m ? Number(m[1]) : null;
-  };
+  // GET: 健康检查 + 可选重新绑定 webhook
+  if (req.method === 'GET') {
+    const setup = req.query?.setup === '1' || String(req.url || '').includes('setup=1');
+    if (setup) {
+      const host = req.headers['x-forwarded-host'] || req.headers.host;
+      const proto = req.headers['x-forwarded-proto'] || 'https';
+      const hook = `${proto}://${host}/api/index.js`;
+      const r = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ url: hook }).toString(),
+      });
+      const j = await r.json();
+      return res.status(200).json({ ok: true, mode: 'setup', webhook: hook, telegram: j });
+    }
+    return res.status(200).json({ ok: true, mode: 'relay' });
+  }
+
+  if (req.method !== 'POST') return res.status(200).json({ ok: true });
 
   try {
     const update = req.body || {};
@@ -37,13 +43,12 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    if (!msg || !msg.chat || !msg.from) {
-      return res.status(200).json({ ok: true });
-    }
+    if (!msg || !msg.chat || !msg.from) return res.status(200).json({ ok: true });
 
     const fromId = Number(msg.from.id);
     const chatId = Number(msg.chat.id);
 
+    // 管理员消息 -> 回传给目标用户
     if (fromId === ADMIN_ID) {
       if (msg.text === '/start' || msg.text === '/help') {
         await api('sendMessage', {
@@ -61,9 +66,17 @@ export default async function handler(req, res) {
       let targetUid = null;
       const cmd = (msg.text || '').match(/^\/reply_(\d+)\s+([\s\S]+)/);
       if (cmd) targetUid = Number(cmd[1]);
-      if (!targetUid && msg.reply_to_message) targetUid = tagOf(msg.reply_to_message);
+      if (!targetUid && msg.reply_to_message) {
+        const src = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+        const m = src.match(/\[UID:(\d+)\]/);
+        if (m) targetUid = Number(m[1]);
+      }
 
       if (!targetUid) {
+        await api('sendMessage', {
+          chat_id: ADMIN_ID,
+          text: 'ℹ️ 你当前是管理员会话：\n- 直接回复“机器人转发给你的用户消息”即可回传\n- 或用 /reply_用户ID 内容\n- 用 /id 查看管理员ID',
+        });
         return res.status(200).json({ ok: true });
       }
 
@@ -76,89 +89,52 @@ export default async function handler(req, res) {
       if (msg.text) {
         await api('sendMessage', { chat_id: targetUid, text: msg.text });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.photo) {
+      } else if (msg.photo) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
         await api('sendPhoto', { chat_id: targetUid, photo: fileId, caption: msg.caption || '' });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 图片已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.video) {
+      } else if (msg.video) {
         await api('sendVideo', { chat_id: targetUid, video: msg.video.file_id, caption: msg.caption || '' });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 视频已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.document) {
+      } else if (msg.document) {
         await api('sendDocument', { chat_id: targetUid, document: msg.document.file_id, caption: msg.caption || '' });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 文件已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.audio) {
+      } else if (msg.audio) {
         await api('sendAudio', { chat_id: targetUid, audio: msg.audio.file_id, caption: msg.caption || '' });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 音频已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.voice) {
+      } else if (msg.voice) {
         await api('sendVoice', { chat_id: targetUid, voice: msg.voice.file_id, caption: msg.caption || '' });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 语音已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.sticker) {
+      } else if (msg.sticker) {
         await api('sendSticker', { chat_id: targetUid, sticker: msg.sticker.file_id });
         await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 贴纸已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
       }
 
       return res.status(200).json({ ok: true });
     }
 
+    // 普通用户消息 -> 转发给管理员
     const uname = msg.from.username ? ` @${msg.from.username}` : '';
-    const header = `📨 来自匿名用户\n[UID:${fromId}]\n👤 ${esc(nameOf(msg.from))}${uname}\n\n`;
+    const name = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ') || msg.from.username || `用户${fromId}`;
+    const header = `📨 来自匿名用户\n[UID:${fromId}]\n👤 ${name}${uname}\n\n`;
 
     if (msg.text) {
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: header + esc(msg.text),
-        parse_mode: 'HTML',
-      });
+      await api('sendMessage', { chat_id: ADMIN_ID, text: header + msg.text });
     } else if (msg.photo) {
       const fileId = msg.photo[msg.photo.length - 1].file_id;
-      await api('sendPhoto', {
-        chat_id: ADMIN_ID,
-        photo: fileId,
-        caption: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n\n${msg.caption || ''}`,
-      });
+      await api('sendPhoto', { chat_id: ADMIN_ID, photo: fileId, caption: `[UID:${fromId}]\n${name}${uname}\n\n${msg.caption || ''}` });
     } else if (msg.video) {
-      await api('sendVideo', {
-        chat_id: ADMIN_ID,
-        video: msg.video.file_id,
-        caption: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n\n${msg.caption || ''}`,
-      });
+      await api('sendVideo', { chat_id: ADMIN_ID, video: msg.video.file_id, caption: `[UID:${fromId}]\n${name}${uname}\n\n${msg.caption || ''}` });
     } else if (msg.document) {
-      await api('sendDocument', {
-        chat_id: ADMIN_ID,
-        document: msg.document.file_id,
-        caption: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n\n${msg.caption || ''}`,
-      });
+      await api('sendDocument', { chat_id: ADMIN_ID, document: msg.document.file_id, caption: `[UID:${fromId}]\n${name}${uname}\n\n${msg.caption || ''}` });
     } else if (msg.audio) {
-      await api('sendAudio', {
-        chat_id: ADMIN_ID,
-        audio: msg.audio.file_id,
-        caption: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n\n${msg.caption || ''}`,
-      });
+      await api('sendAudio', { chat_id: ADMIN_ID, audio: msg.audio.file_id, caption: `[UID:${fromId}]\n${name}${uname}\n\n${msg.caption || ''}` });
     } else if (msg.voice) {
       await api('sendVoice', { chat_id: ADMIN_ID, voice: msg.voice.file_id });
-      await api('sendMessage', { chat_id: ADMIN_ID, text: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n[语音消息]` });
+      await api('sendMessage', { chat_id: ADMIN_ID, text: `[UID:${fromId}]\n${name}${uname}\n[语音消息]` });
     } else if (msg.sticker) {
       await api('sendSticker', { chat_id: ADMIN_ID, sticker: msg.sticker.file_id });
-      await api('sendMessage', { chat_id: ADMIN_ID, text: `[UID:${fromId}]\n${nameOf(msg.from)}${uname}\n[贴纸]` });
+      await api('sendMessage', { chat_id: ADMIN_ID, text: `[UID:${fromId}]\n${name}${uname}\n[贴纸]` });
     }
 
     if (ECHO_MODE && !((msg.text || '').startsWith('/'))) {
@@ -167,6 +143,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: e.message });
+    console.log('relay_error', e?.message || String(e));
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
 }
