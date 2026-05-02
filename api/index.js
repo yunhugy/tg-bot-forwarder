@@ -136,6 +136,43 @@ export default async function handler(req, res) {
     return p;
   }
 
+  function detectAdSpam(text = '') {
+    const raw = String(text || '');
+    const t = raw.toLowerCase();
+    if (!t.trim()) return { hit: false, reason: '' };
+
+    let score = 0;
+    const hits = [];
+
+    const add = (ok, s, name) => {
+      if (ok) { score += s; hits.push(name); }
+    };
+
+    // 强特征
+    add(/(t\.me\/|telegram\.me\/|tg\s*[:：]?\s*@|频道[:：]?\s*@|群[:：]?\s*@)/i.test(raw), 4, 'TG引流链接');
+    add(/@[a-zA-Z0-9_]{4,}/.test(raw), 2, '@用户名');
+    add(/(http[s]?:\/\/|www\.)/i.test(raw), 3, '外链');
+
+    // 中特征
+    add(/(群发|引流|推广|广告|频道|加群|拉群)/i.test(raw), 2, '推广词');
+    add(/(验证|认证|自动处理验证|批量分发|代发|机器人分发)/i.test(raw), 2, '分发词');
+    add(/(vx[:：]?|v信|微信|qq|whatsapp|line\s*id|联系我|加我)/i.test(raw), 2, '联系方式引导');
+    add(/(博彩|带单|首充|返佣|代理招募|兼职赚钱|刷单|日结)/i.test(raw), 3, '灰产词');
+
+    // 组合加权：有@用户名 + 推广词/验证词
+    const hasAt = /@[a-zA-Z0-9_]{4,}/.test(raw);
+    const hasPromo = /(群发|引流|推广|频道|验证|自动处理验证|批量分发)/i.test(raw);
+    add(hasAt && hasPromo, 3, '组合命中');
+
+    // 超长文案 + 标点堆叠
+    add(raw.length > 120 && /[!！$￥#*]{3,}/.test(raw), 2, '刷屏样式');
+
+    if (score >= 4) {
+      return { hit: true, reason: hits.slice(0, 3).join('+') || '广告高风险' };
+    }
+    return { hit: false, reason: '' };
+  }
+
   async function getCurrentTarget() {
     if (hasRedis) {
       const r = await redis('GET', 'relay:admin:current_target');
@@ -190,7 +227,7 @@ export default async function handler(req, res) {
       if (msg.text === '/start' || msg.text === '/help') {
         await api('sendMessage', {
           chat_id: ADMIN_ID,
-          text: '管理员命令：\n/start - 帮助\n/help - 帮助\n/id - 管理员ID\n/status - 机器人状态\n/users - 最近用户\n/reply - 回复说明\n/user_<ID> - 查看用户资料\n/ban_<ID> - 拉黑用户\n/unban_<ID> - 取消拉黑\n/note_<ID> 备注 - 设置备注\n/tag_<ID> 标签 - 添加标签\n/untag_<ID> 标签 - 移除标签',
+          text: '管理员命令：\n/start - 帮助\n/help - 帮助\n/id - 管理员ID\n/status - 机器人状态\n/users - 最近用户\n/reply - 回复说明\n/user_<ID> - 查看用户资料\n/ban_<ID> - 拉黑用户\n/unban_<ID> - 取消拉黑\n/note_<ID> 备注 - 设置备注\n/tag_<ID> 标签 - 添加标签\n/untag_<ID> 标签 - 移除标签\n\n已启用：广告关键词自动拉黑（命中后自动封禁并通知管理员）',
         });
         return res.status(200).json({ ok: true });
       }
@@ -227,7 +264,7 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      const toCmd = (msg.text || '').match(/^\/to_(\d+)$/);
+      const toCmd = (msg.text || '').match(/^\/to(?:_|\s)+(\d+)$/);
       if (toCmd) {
         const uid = Number(toCmd[1]);
         const u = await getUser(uid);
@@ -255,7 +292,7 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      const userCmd = (msg.text || '').match(/^\/user_(\d+)$/);
+      const userCmd = (msg.text || '').match(/^\/user(?:_|\s)+(\d+)$/);
       if (userCmd) {
         const uid = Number(userCmd[1]);
         const u = await getUser(uid);
@@ -266,39 +303,48 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      const banCmd = (msg.text || '').match(/^\/ban_(\d+)$/);
+      const banCmd = (msg.text || '').match(/^\/ban(?:_|\s)+(\d+)$/);
       if (banCmd) {
         const u = await setBan(Number(banCmd[1]), true);
         await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已拉黑 ${u.id}` : '用户不存在' });
         return res.status(200).json({ ok: true });
       }
-      const unbanCmd = (msg.text || '').match(/^\/unban_(\d+)$/);
+      const unbanCmd = (msg.text || '').match(/^\/unban(?:_|\s)+(\d+)$/);
       if (unbanCmd) {
         const u = await setBan(Number(unbanCmd[1]), false);
         await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已取消拉黑 ${u.id}` : '用户不存在' });
         return res.status(200).json({ ok: true });
       }
-      const noteCmd = (msg.text || '').match(/^\/note_(\d+)\s+([\s\S]+)$/);
+      const noteCmd = (msg.text || '').match(/^\/note(?:_|\s)+(\d+)\s+([\s\S]+)$/);
       if (noteCmd) {
         const u = await setNote(Number(noteCmd[1]), noteCmd[2]);
         await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已设置备注：${u.note}` : '用户不存在' });
         return res.status(200).json({ ok: true });
       }
-      const tagCmd = (msg.text || '').match(/^\/tag_(\d+)\s+(.+)$/);
+      const tagCmd = (msg.text || '').match(/^\/tag(?:_|\s)+(\d+)\s+(.+)$/);
       if (tagCmd) {
         const u = await addTag(Number(tagCmd[1]), tagCmd[2]);
         await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已添加标签：${tagCmd[2]}` : '用户不存在' });
         return res.status(200).json({ ok: true });
       }
-      const untagCmd = (msg.text || '').match(/^\/untag_(\d+)\s+(.+)$/);
+      const untagCmd = (msg.text || '').match(/^\/untag(?:_|\s)+(\d+)\s+(.+)$/);
       if (untagCmd) {
         const u = await removeTag(Number(untagCmd[1]), untagCmd[2]);
         await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已移除标签：${untagCmd[2]}` : '用户不存在' });
         return res.status(200).json({ ok: true });
       }
 
+      const malformedAdminCmd = (msg.text || '').match(/^\/(ban|unban|user|note|tag|untag|to|reply)\b(?![_\s])/);
+      if (malformedAdminCmd) {
+        await api('sendMessage', {
+          chat_id: ADMIN_ID,
+          text: '命令格式不正确。\n示例：\n/ban 123456\n/unban 123456\n/user 123456\n/to 123456\n/reply 123456 你好\n/note 123456 备注\n/tag 123456 重点\n/untag 123456 重点',
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       let targetUid = null;
-      const replyCmd = (msg.text || '').match(/^\/reply_(\d+)\s+([\s\S]+)/);
+      const replyCmd = (msg.text || '').match(/^\/reply(?:_|\s)+(\d+)\s+([\s\S]+)/);
       if (replyCmd) targetUid = Number(replyCmd[1]);
       if (!targetUid && msg.reply_to_message) {
         const src = msg.reply_to_message.text || msg.reply_to_message.caption || '';
@@ -352,6 +398,23 @@ export default async function handler(req, res) {
     let profile = await ensureProfile(msg.from);
     profile = await updateProfileMessage(fromId, msg.text || msg.caption || (msg.photo ? '[图片]' : msg.video ? '[视频]' : msg.document ? '[文件]' : msg.voice ? '[语音]' : msg.audio ? '[音频]' : msg.sticker ? '[贴纸]' : '[消息]'));
     await setCurrentTarget(fromId);
+
+    // 自动广告识别与拉黑
+    const contentForDetect = msg.text || msg.caption || '';
+
+    // 强兜底：@账号 + 推广语义，直接拉黑
+    const hardSpam = /@[a-zA-Z0-9_]{4,}/.test(contentForDetect) && /(群发|验证|频道|引流|推广|自动处理验证|批量分发)/i.test(contentForDetect);
+    const ad = hardSpam ? { hit: true, reason: '强规则:@账号+推广语义' } : detectAdSpam(contentForDetect);
+    if (ad.hit) {
+      profile = await setBan(fromId, true);
+      await addTag(fromId, '自动拉黑');
+      await addTag(fromId, `命中:${ad.reason}`);
+      await api('sendMessage', {
+        chat_id: ADMIN_ID,
+        text: `🚫 已自动拉黑疑似广告用户\n用户: ${profile?.username ? '@'+profile.username : profile?.nickname || fromId}\nID: ${fromId}\n原因: ${ad.reason}\n内容: ${contentForDetect.slice(0, 120) || '[非文本媒体]'}`,
+      });
+      return res.status(200).json({ ok: true, auto_banned: true });
+    }
 
     if (profile?.banned) {
       return res.status(200).json({ ok: true, blocked: true });
