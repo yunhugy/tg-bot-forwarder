@@ -166,31 +166,30 @@ export default async function handler(req, res) {
 
     let score = 0;
     const hits = [];
-
-    const add = (ok, s, name) => {
-      if (ok) { score += s; hits.push(name); }
-    };
+    const add = (ok, s, name) => { if (ok) { score += s; hits.push(name); } };
 
     // 强特征
-    add(/(t\.me\/|telegram\.me\/|tg\s*[:：]?\s*@|频道[:：]?\s*@|群[:：]?\s*@)/i.test(raw), 4, 'TG引流链接');
-    add(/@[a-zA-Z0-9_]{4,}/.test(raw), 2, '@用户名');
-    add(/(http[s]?:\/\/|www\.)/i.test(raw), 3, '外链');
+    add(/(t\.me\/|telegram\.me\/|tg\s*[:：]?\s*@|频道[:：]?\s*@|群[:：]?\s*@|私聊[:：]?\s*@)/i.test(raw), 5, 'TG引流');
+    add(/@[a-zA-Z0-9_]{4,}/.test(raw), 2, '@账号');
+    add(/(https?:\/\/|www\.)/i.test(raw), 3, '外链');
 
-    // 中特征
-    add(/(群发|引流|推广|广告|频道|加群|拉群)/i.test(raw), 2, '推广词');
-    add(/(验证|认证|自动处理验证|批量分发|代发|机器人分发)/i.test(raw), 2, '分发词');
-    add(/(vx[:：]?|v信|微信|qq|whatsapp|line\s*id|联系我|加我)/i.test(raw), 2, '联系方式引导');
-    add(/(博彩|带单|首充|返佣|代理招募|兼职赚钱|刷单|日结)/i.test(raw), 3, '灰产词');
+    // 推广/诈骗语义
+    add(/(群发|引流|推广|广告|渠道|频道|加群|拉群|进群|私聊|联系)/i.test(raw), 2, '推广语义');
+    add(/(自动处理验证|自动验证|批量分发|代发|推广系统|脚本群发|机器人群发)/i.test(raw), 4, '自动化群发');
+    add(/(代理|返佣|分成|拉新|首充|送彩金|高返|稳赚|带单|导师|包赔|包赚)/i.test(raw), 4, '诈骗灰产');
+    add(/(兼职赚钱|日结|刷单|副业躺赚|零成本高回报)/i.test(raw), 3, '网赚诱导');
+    add(/(vx[:：]?|v信|微信|qq|whatsapp|line\s*id)/i.test(raw), 2, '导流联系方式');
 
-    // 组合加权：有@用户名 + 推广词/验证词
+    // 组合规则（你截图这类）
     const hasAt = /@[a-zA-Z0-9_]{4,}/.test(raw);
-    const hasPromo = /(群发|引流|推广|频道|验证|自动处理验证|批量分发)/i.test(raw);
-    add(hasAt && hasPromo, 3, '组合命中');
+    const hasBroadcast = /(群发|批量分发|自动处理验证|推广|引流)/i.test(raw);
+    if (hasAt && hasBroadcast) {
+      score += 6;
+      hits.push('组合:@账号+群发语义');
+    }
 
-    // 超长文案 + 标点堆叠
-    add(raw.length > 120 && /[!！$￥#*]{3,}/.test(raw), 2, '刷屏样式');
-
-    if (score >= 4) {
+    // 阈值
+    if (score >= 6) {
       return { hit: true, reason: hits.slice(0, 3).join('+') || '广告高风险' };
     }
     return { hit: false, reason: '' };
@@ -434,6 +433,14 @@ export default async function handler(req, res) {
     // 强兜底：@账号 + 推广语义，直接拉黑
     const hardSpam = /@[a-zA-Z0-9_]{4,}/.test(contentForDetect) && /(群发|验证|频道|引流|推广|自动处理验证|批量分发)/i.test(contentForDetect);
     const ad = hardSpam ? { hit: true, reason: '强规则:@账号+推广语义' } : detectAdSpam(contentForDetect);
+
+    // 管理员影子提示：命中明显推广词但未达阈值（用于调参）
+    if (!ad.hit && /(群发|推广|引流|频道|自动处理验证|批量分发|代理|返佣)/i.test(contentForDetect)) {
+      await api('sendMessage', {
+        chat_id: ADMIN_ID,
+        text: `⚠️ 可疑推广（未自动拉黑）\n用户: ${profile?.username ? '@'+profile.username : profile?.nickname || fromId}\nID: ${fromId}\n内容: ${contentForDetect.slice(0, 120)}`,
+      });
+    }
     if (ad.hit) {
       profile = await setBan(fromId, true);
       await addTag(fromId, '自动拉黑');
