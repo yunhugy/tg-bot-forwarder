@@ -1,198 +1,150 @@
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
 
-  const token = (process.env.TG_BOT_TOKEN || '').trim().replace(/^bot/i, '');
+  const BOT = (process.env.TG_BOT_TOKEN || '').trim().replace(/^bot/i, '');
   const ADMIN_ID = Number(process.env.ADMIN_ID || '6609386680');
   const ECHO_MODE = process.env.ECHO_MODE !== 'false';
+
   const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || '';
   const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 
-  if (!token) return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN not set' });
+  const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+  const GH_OWNER = process.env.GITHUB_OWNER || 'yunhugy';
+  const GH_REPO = process.env.GITHUB_REPO || 'tg-bot-forwarder';
+  const GH_BANS_PATH = process.env.GITHUB_BANS_PATH || 'bans.json';
 
-  const api = (method, body) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  }).then(r => r.json());
-
-  // -------- storage layer --------
-  const mem = globalThis.__relay_mem || (globalThis.__relay_mem = {
-    users: {}, recent: [], hardBans: {}
-  });
+  if (!BOT) return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN missing' });
 
   const hasRedis = !!(REDIS_URL && REDIS_TOKEN);
+  const hasGithubStore = !!GH_TOKEN;
+
+  const mem = globalThis.__relay_mem || (globalThis.__relay_mem = { users: {}, recent: [], hardBans: {}, currentTarget: null });
+
+  const tg = (method, body) => fetch(`https://api.telegram.org/bot${BOT}/${method}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  }).then(r => r.json());
+
   const redis = async (cmd, ...args) => {
-    const r = await fetch(`${REDIS_URL}/${cmd}/${args.map(v => encodeURIComponent(String(v))).join('/')}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
+    const url = `${REDIS_URL}/${cmd}/${args.map(a => encodeURIComponent(String(a))).join('/')}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${REDIS_TOKEN}` } });
     return r.json();
   };
+
+  async function ghGetBans() {
+    if (!hasGithubStore) return { map: {}, sha: null };
+    const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${encodeURIComponent(GH_BANS_PATH)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'markgetbot' } });
+    if (r.status === 404) return { map: {}, sha: null };
+    const d = await r.json();
+    const txt = Buffer.from(d.content || '', 'base64').toString('utf8') || '{}';
+    let map = {};
+    try { map = JSON.parse(txt); } catch { map = {}; }
+    return { map, sha: d.sha || null };
+  }
+
+  async function ghPutBans(map, sha) {
+    if (!hasGithubStore) return false;
+    const url = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${encodeURIComponent(GH_BANS_PATH)}`;
+    const body = {
+      message: 'chore: update bans.json by bot',
+      content: Buffer.from(JSON.stringify(map, null, 2), 'utf8').toString('base64'),
+      branch: 'main'
+    };
+    if (sha) body.sha = sha;
+    const r = await fetch(url, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'markgetbot' },
+      body: JSON.stringify(body)
+    });
+    return r.ok;
+  }
+
+  function profileTitle(u) { return u?.username ? `@${u.username}` : (u?.nickname || `用户${u?.id || ''}`); }
 
   async function getUser(uid) {
     if (hasRedis) {
       const r = await redis('GET', `relay:user:${uid}`);
       return r.result ? JSON.parse(r.result) : null;
     }
-    return mem.users[uid] || null;
+    return mem.users[String(uid)] || null;
   }
 
   async function saveUser(uid, data) {
+    const key = String(uid);
     if (hasRedis) {
-      await redis('SET', `relay:user:${uid}`, JSON.stringify(data));
-      await redis('ZADD', 'relay:recent', Date.now(), uid);
+      await redis('SET', `relay:user:${key}`, JSON.stringify(data));
+      await redis('ZADD', 'relay:recent', Date.now(), key);
       return;
     }
-    mem.users[uid] = data;
-    mem.recent = [uid, ...mem.recent.filter(x => String(x) !== String(uid))].slice(0, 50);
+    mem.users[key] = data;
+    mem.recent = [key, ...mem.recent.filter(x => x !== key)].slice(0, 300);
   }
 
-  async function listRecentUsers(limit = 10) {
+  async function listRecentUsers(limit = 20) {
     if (hasRedis) {
-      const r = await redis('ZREVRANGE', 'relay:recent', 0, limit - 1);
+      const r = await redis('ZREVRANGE', 'relay:recent', 0, Math.max(0, limit - 1));
       const ids = r.result || [];
       const out = [];
-      for (const uid of ids) {
-        const u = await getUser(uid);
-        if (u) out.push(u);
-      }
+      for (const id of ids) { const u = await getUser(id); if (u) out.push(u); }
       return out;
     }
-    return mem.recent.slice(0, limit).map(uid => mem.users[uid]).filter(Boolean);
-  }
-
-  function displayName(user) {
-    return [user?.first_name, user?.last_name].filter(Boolean).join(' ') || user?.username || '匿名用户';
-  }
-
-  function profileTitle(profile) {
-    const nick = profile.nickname || '匿名用户';
-    const uname = profile.username ? ` @${profile.username}` : '';
-    const tags = profile.tags?.length ? ` [${profile.tags.join(', ')}]` : '';
-    const note = profile.note ? ` (${profile.note})` : '';
-    return `${nick}${uname}${tags}${note}`;
+    return mem.recent.slice(0, limit).map(id => mem.users[id]).filter(Boolean);
   }
 
   async function ensureProfile(from) {
     const uid = Number(from.id);
-    const existing = await getUser(uid);
-    const profile = {
-      id: uid,
-      nickname: displayName(from),
-      username: from.username || '',
-      first_name: from.first_name || '',
-      last_name: from.last_name || '',
-      banned: existing?.banned || false,
-      tags: existing?.tags || [],
-      note: existing?.note || '',
-      created_at: existing?.created_at || Date.now(),
-      last_seen_at: Date.now(),
-      last_message_preview: existing?.last_message_preview || '',
-      message_count: (existing?.message_count || 0),
+    const old = await getUser(uid);
+    const p = old || {
+      id: uid, username: from.username || '', first_name: from.first_name || '', last_name: from.last_name || '',
+      nickname: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || `用户${uid}`,
+      banned: false, tags: [], note: '', created_at: Date.now(), last_seen_at: Date.now(), last_message_preview: '', message_count: 0
     };
-    await saveUser(uid, profile);
-    return profile;
+    p.username = from.username || p.username || '';
+    p.first_name = from.first_name || p.first_name || '';
+    p.last_name = from.last_name || p.last_name || '';
+    p.nickname = [p.first_name, p.last_name].filter(Boolean).join(' ') || p.username || p.nickname;
+    p.last_seen_at = Date.now();
+    await saveUser(uid, p);
+    return p;
   }
 
   async function updateProfileMessage(uid, preview) {
-    const p = await getUser(uid);
-    if (!p) return null;
+    const p = await getUser(uid); if (!p) return null;
+    p.last_message_preview = String(preview || '').slice(0, 180);
     p.last_seen_at = Date.now();
-    p.last_message_preview = preview || p.last_message_preview || '';
     p.message_count = (p.message_count || 0) + 1;
     await saveUser(uid, p);
     return p;
   }
 
   async function setBan(uid, banned) {
-    const p = await getUser(uid);
-    const profile = p || {
-      id: Number(uid),
-      nickname: `用户${uid}`,
-      username: '',
-      first_name: '',
-      last_name: '',
-      banned: false,
-      tags: [],
-      note: '',
-      created_at: Date.now(),
-      last_seen_at: Date.now(),
-      last_message_preview: '',
-      message_count: 0,
-    };
-    profile.banned = banned;
-    profile.last_seen_at = Date.now();
-    await saveUser(uid, profile);
-    // 内存硬拉黑（fallback场景）
-    mem.hardBans[String(uid)] = !!banned;
-    return profile;
+    const u = Number(uid);
+    const p = (await getUser(u)) || { id: u, nickname: `用户${u}`, username: '', first_name: '', last_name: '', banned: false, tags: [], note: '', created_at: Date.now(), last_seen_at: Date.now(), last_message_preview: '', message_count: 0 };
+    p.banned = !!banned;
+    await saveUser(u, p);
+    mem.hardBans[String(u)] = !!banned;
+    if (hasGithubStore) {
+      const { map, sha } = await ghGetBans();
+      map[String(u)] = !!banned;
+      await ghPutBans(map, sha);
+    }
+    return p;
   }
 
   async function isBanned(uid) {
     const u = await getUser(uid);
     if (u?.banned) return true;
     if (mem.hardBans[String(uid)]) return true;
+    if (hasGithubStore) {
+      const { map } = await ghGetBans();
+      if (map[String(uid)] === true) return true;
+    }
     return false;
   }
 
-  async function setNote(uid, note) {
-    const p = await getUser(uid);
-    if (!p) return null;
-    p.note = note;
-    await saveUser(uid, p);
-    return p;
-  }
-
-  async function addTag(uid, tag) {
-    const p = await getUser(uid);
-    if (!p) return null;
-    const t = String(tag).trim();
-    if (t && !p.tags.includes(t)) p.tags.push(t);
-    await saveUser(uid, p);
-    return p;
-  }
-
-  async function removeTag(uid, tag) {
-    const p = await getUser(uid);
-    if (!p) return null;
-    p.tags = (p.tags || []).filter(x => x !== tag);
-    await saveUser(uid, p);
-    return p;
-  }
-
-  function detectAdSpam(text = '') {
-    const raw = String(text || '');
-    const t = raw.toLowerCase();
-    if (!t.trim()) return { hit: false, reason: '' };
-
-    let score = 0;
-    const hits = [];
-    const add = (ok, s, name) => { if (ok) { score += s; hits.push(name); } };
-
-    // 强特征
-    add(/(t\.me\/|telegram\.me\/|tg\s*[:：]?\s*@|频道[:：]?\s*@|群[:：]?\s*@|私聊[:：]?\s*@)/i.test(raw), 5, 'TG引流');
-    add(/@[a-zA-Z0-9_]{4,}/.test(raw), 2, '@账号');
-    add(/(https?:\/\/|www\.)/i.test(raw), 3, '外链');
-
-    // 推广/诈骗语义
-    add(/(群发|引流|推广|广告|渠道|频道|加群|拉群|进群|私聊|联系)/i.test(raw), 2, '推广语义');
-    add(/(自动处理验证|自动验证|批量分发|代发|推广系统|脚本群发|机器人群发)/i.test(raw), 4, '自动化群发');
-    add(/(代理|返佣|分成|拉新|首充|送彩金|高返|稳赚|带单|导师|包赔|包赚)/i.test(raw), 4, '诈骗灰产');
-    add(/(兼职赚钱|日结|刷单|副业躺赚|零成本高回报)/i.test(raw), 3, '网赚诱导');
-    add(/(vx[:：]?|v信|微信|qq|whatsapp|line\s*id)/i.test(raw), 2, '导流联系方式');
-
-    // 组合规则（你截图这类）
-    const hasAt = /@[a-zA-Z0-9_]{4,}/.test(raw);
-    const hasBroadcast = /(群发|批量分发|自动处理验证|推广|引流)/i.test(raw);
-    if (hasAt && hasBroadcast) {
-      score += 6;
-      hits.push('组合:@账号+群发语义');
-    }
-
-    // 阈值
-    if (score >= 6) {
-      return { hit: true, reason: hits.slice(0, 3).join('+') || '广告高风险' };
-    }
-    return { hit: false, reason: '' };
+  async function setCurrentTarget(uid) {
+    if (hasRedis) { await redis('SET', 'relay:admin:current_target', uid); return; }
+    mem.currentTarget = Number(uid);
   }
 
   async function getCurrentTarget() {
@@ -203,320 +155,170 @@ export default async function handler(req, res) {
     return mem.currentTarget || null;
   }
 
-  async function setCurrentTarget(uid) {
-    if (hasRedis) {
-      await redis('SET', 'relay:admin:current_target', uid);
-      return;
-    }
-    mem.currentTarget = Number(uid);
+  function detectAdSpam(text = '') {
+    const raw = String(text || ''); if (!raw.trim()) return { hit: false, reason: '' };
+    let score = 0; const hits = []; const add = (ok,s,n)=>{ if(ok){score+=s;hits.push(n);} };
+    add(/(t\.me\/|telegram\.me\/|tg\s*[:：]?\s*@|频道[:：]?\s*@|群[:：]?\s*@|私聊[:：]?\s*@)/i.test(raw), 5, 'TG引流');
+    add(/@[a-zA-Z0-9_]{4,}/.test(raw), 2, '@账号');
+    add(/(https?:\/\/|www\.)/i.test(raw), 3, '外链');
+    add(/(群发|引流|推广|广告|渠道|频道|加群|拉群|进群|私聊|联系)/i.test(raw), 2, '推广语义');
+    add(/(自动处理验证|自动验证|批量分发|代发|推广系统|脚本群发|机器人群发)/i.test(raw), 4, '自动化群发');
+    add(/(代理|返佣|分成|拉新|首充|送彩金|高返|稳赚|带单|导师|包赔|包赚)/i.test(raw), 4, '诈骗灰产');
+    if (/@[a-zA-Z0-9_]{4,}/.test(raw) && /(群发|批量分发|自动处理验证|推广|引流)/i.test(raw)) { score += 6; hits.push('组合命中'); }
+    return score >= 6 ? { hit: true, reason: hits.slice(0,3).join('+') } : { hit: false, reason: '' };
   }
 
-  // -------- GET / setup --------
+  // GET utils
   if (req.method === 'GET') {
-    const setup = req.query?.setup === '1' || String(req.url || '').includes('setup=1');
-    const checkUidMatch = String(req.url || '').match(/[?&](?:check_uid|uid)=(\d+)/);
-    if (checkUidMatch) {
-      const uid = Number(checkUidMatch[1]);
-      const u = await getUser(uid);
-      return res.status(200).json({ ok: true, uid, found: !!u, user: u || null, storage: hasRedis ? 'redis' : 'memory' });
-    }
-    if (setup) {
+    const q = String(req.url || '');
+    if (q.includes('setup=1')) {
       const host = req.headers['x-forwarded-host'] || req.headers.host;
       const proto = req.headers['x-forwarded-proto'] || 'https';
       const hook = `${proto}://${host}/api/index.js`;
-      const r = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ url: hook }).toString(),
+      const r = await fetch(`https://api.telegram.org/bot${BOT}/setWebhook`, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ url: hook }).toString()
       });
-      const j = await r.json();
-      return res.status(200).json({ ok: true, mode: 'setup', webhook: hook, telegram: j, storage: hasRedis ? 'redis' : 'memory' });
+      return res.status(200).json({ ok: true, webhook: hook, telegram: await r.json() });
     }
-    return res.status(200).json({ ok: true, mode: 'relay', storage: hasRedis ? 'redis' : 'memory' });
+
+    const m = q.match(/[?&](?:check_uid|uid)=(\d+)/);
+    if (m) {
+      const uid = Number(m[1]);
+      const user = await getUser(uid);
+      return res.status(200).json({ ok: true, uid, found: !!user, user, storage: hasRedis ? 'redis' : (hasGithubStore ? 'github_bans+memory' : 'memory') });
+    }
+
+    if (q.includes('stats=1')) {
+      const users = await listRecentUsers(500);
+      const bannedUsers = [];
+      for (const u of users) if (await isBanned(u.id)) bannedUsers.push({ id: u.id, username: u.username || '', nickname: u.nickname || '' });
+      return res.status(200).json({ ok: true, storage: hasRedis ? 'redis' : (hasGithubStore ? 'github_bans+memory' : 'memory'), total_users: users.length, banned_count: bannedUsers.length, banned_users: bannedUsers.slice(0, 100) });
+    }
+
+    return res.status(200).json({ ok: true, mode: 'relay' });
   }
 
   if (req.method !== 'POST') return res.status(200).json({ ok: true });
 
   try {
-    const update = req.body || {};
-    const msg = update.message;
-    const cb = update.callback_query;
-
-    if (cb) {
-      await api('answerCallbackQuery', { callback_query_id: cb.id });
-      return res.status(200).json({ ok: true });
-    }
-    if (!msg || !msg.chat || !msg.from) return res.status(200).json({ ok: true });
+    const upd = req.body || {};
+    const msg = upd.message;
+    if (!msg || !msg.from || !msg.chat) return res.status(200).json({ ok: true });
 
     const fromId = Number(msg.from.id);
 
-    // ---------- admin side ----------
+    // ADMIN
     if (fromId === ADMIN_ID) {
-      if (msg.text === '/start' || msg.text === '/help') {
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: '管理员命令：\n/start - 帮助\n/help - 帮助\n/id - 管理员ID\n/status - 机器人状态\n/users - 最近用户\n/reply - 回复说明\n/user_<ID> - 查看用户资料\n/ban_<ID> - 拉黑用户\n/unban_<ID> - 取消拉黑\n/note_<ID> 备注 - 设置备注\n/tag_<ID> 标签 - 添加标签\n/untag_<ID> 标签 - 移除标签\n\n已启用：广告关键词自动拉黑（命中后自动封禁并通知管理员）',
-        });
+      const txt = String(msg.text || '');
+      if (txt === '/start' || txt === '/help') {
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: '管理员命令:\n/users\n/current\n/to <ID>\n/ban <ID>\n/unban <ID>\n/reply <ID> 内容\n/status\n/id' });
         return res.status(200).json({ ok: true });
       }
-
-      if (msg.text === '/id') {
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `你的 ADMIN_ID: ${ADMIN_ID}` });
+      if (txt === '/id') { await tg('sendMessage', { chat_id: ADMIN_ID, text: `ADMIN_ID: ${ADMIN_ID}` }); return res.status(200).json({ ok: true }); }
+      if (txt === '/status') { await tg('sendMessage', { chat_id: ADMIN_ID, text: `存储: ${hasRedis ? 'redis' : (hasGithubStore ? 'github_bans+memory' : 'memory')}` }); return res.status(200).json({ ok: true }); }
+      if (txt === '/users') {
+        const users = await listRecentUsers(20);
+        if (!users.length) { await tg('sendMessage', { chat_id: ADMIN_ID, text: '暂无用户记录' }); return res.status(200).json({ ok: true }); }
+        const lines = users.map((u, i) => `${i+1}. ${profileTitle(u)}\nID: ${u.id}\n最近: ${u.last_message_preview || '-'}`).join('\n\n');
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: lines });
         return res.status(200).json({ ok: true });
       }
-
-      if (msg.text === '/status') {
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: `状态：\n- Bot: 正常运行\n- 管理员ID: ${ADMIN_ID}\n- 自动回执: ${ECHO_MODE ? '开启' : '关闭'}\n- 存储: ${hasRedis ? 'Redis 持久化' : '内存临时模式'}\n- 部署: Vercel`,
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.text === '/reply') {
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: '回复用户方法：\n1. 用户一旦发来消息，系统会自动把“当前回复对象”切到该用户\n2. 你直接在对话框输入内容即可回给当前对象\n3. /current 查看当前回复对象\n4. /to_<用户ID> 仅作为手动切换备用\n5. /reply_<用户ID> 内容 也可继续使用',
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (msg.text === '/current') {
-        const current = await getCurrentTarget();
-        if (!current) {
-          await api('sendMessage', { chat_id: ADMIN_ID, text: '当前没有选中的回复对象' });
-        } else {
-          const u = await getUser(current);
-          await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `当前回复对象：${u.username ? '@'+u.username : u.nickname} (${u.id})` : `当前回复对象：${current}` });
+      if (txt === '/current') {
+        const cur = await getCurrentTarget();
+        if (!cur) await tg('sendMessage', { chat_id: ADMIN_ID, text: '当前没有选中的回复对象' });
+        else {
+          const u = await getUser(cur);
+          await tg('sendMessage', { chat_id: ADMIN_ID, text: `当前回复对象：${u ? profileTitle(u) : cur} (${cur})` });
         }
         return res.status(200).json({ ok: true });
       }
 
-      const toCmd = (msg.text || '').match(/^\/to(?:_|\s)+(\d+)$/);
-      if (toCmd) {
-        const uid = Number(toCmd[1]);
-        const u = await getUser(uid);
-        await setCurrentTarget(uid);
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: u ? `已切换当前回复对象：${u.username ? '@'+u.username : u.nickname} (${u.id})\n现在直接输入内容就会发给他。` : `已切换当前回复对象：${uid}`,
-        });
-        return res.status(200).json({ ok: true });
-      }
+      const toCmd = txt.match(/^\/to(?:_|\s)+(\d+)$/);
+      if (toCmd) { await setCurrentTarget(Number(toCmd[1])); await tg('sendMessage', { chat_id: ADMIN_ID, text: `已切换当前回复对象：${toCmd[1]}` }); return res.status(200).json({ ok: true }); }
 
-      if (msg.text === '/users') {
-        const users = await listRecentUsers(15);
-        if (!users.length) {
-          await api('sendMessage', { chat_id: ADMIN_ID, text: '暂无用户记录' });
-          return res.status(200).json({ ok: true });
-        }
-        const lines = users.map((u, i) => {
-          const name = u.username ? `@${u.username}` : u.nickname;
-          const banned = u.banned ? ' 🚫' : '';
-          const tags = u.tags?.length ? ` [${u.tags.join(', ')}]` : '';
-          return `${i + 1}. ${name}${banned}${tags}\nID: ${u.id}\n最近: ${u.last_message_preview || '-'}\n`;
-        });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: lines.join('\n') });
-        return res.status(200).json({ ok: true });
-      }
+      const banCmd = txt.match(/^\/ban(?:_|\s)+(\d+)$/);
+      if (banCmd) { const u = await setBan(Number(banCmd[1]), true); await tg('sendMessage', { chat_id: ADMIN_ID, text: `已拉黑 ${u.id}` }); return res.status(200).json({ ok: true }); }
 
-      const userCmd = (msg.text || '').match(/^\/user(?:_|\s)+(\d+)$/);
-      if (userCmd) {
-        const uid = Number(userCmd[1]);
-        const u = await getUser(uid);
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: u ? `用户资料\n姓名: ${u.nickname}\n用户名: ${u.username || '-'}\nID: ${u.id}\n标签: ${(u.tags || []).join(', ') || '-'}\n备注: ${u.note || '-'}\n状态: ${u.banned ? '已拉黑' : '正常'}\n消息数: ${u.message_count || 0}\n最后消息: ${u.last_message_preview || '-'}\n最后活跃: ${u.last_seen_at ? new Date(u.last_seen_at).toLocaleString('zh-CN') : '-'}` : '用户不存在',
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      const banCmd = (msg.text || '').match(/^\/ban(?:_|\s)+(\d+)$/);
-      if (banCmd) {
-        const u = await setBan(Number(banCmd[1]), true);
-        await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已拉黑 ${u.id}` : '用户不存在' });
-        return res.status(200).json({ ok: true });
-      }
-      const unbanCmd = (msg.text || '').match(/^\/unban(?:_|\s)+(\d+)$/);
-      if (unbanCmd) {
-        const u = await setBan(Number(unbanCmd[1]), false);
-        await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已取消拉黑 ${u.id}` : '用户不存在' });
-        return res.status(200).json({ ok: true });
-      }
-      const noteCmd = (msg.text || '').match(/^\/note(?:_|\s)+(\d+)\s+([\s\S]+)$/);
-      if (noteCmd) {
-        const u = await setNote(Number(noteCmd[1]), noteCmd[2]);
-        await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已设置备注：${u.note}` : '用户不存在' });
-        return res.status(200).json({ ok: true });
-      }
-      const tagCmd = (msg.text || '').match(/^\/tag(?:_|\s)+(\d+)\s+(.+)$/);
-      if (tagCmd) {
-        const u = await addTag(Number(tagCmd[1]), tagCmd[2]);
-        await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已添加标签：${tagCmd[2]}` : '用户不存在' });
-        return res.status(200).json({ ok: true });
-      }
-      const untagCmd = (msg.text || '').match(/^\/untag(?:_|\s)+(\d+)\s+(.+)$/);
-      if (untagCmd) {
-        const u = await removeTag(Number(untagCmd[1]), untagCmd[2]);
-        await api('sendMessage', { chat_id: ADMIN_ID, text: u ? `已移除标签：${untagCmd[2]}` : '用户不存在' });
-        return res.status(200).json({ ok: true });
-      }
-
-      const malformedAdminCmd = (msg.text || '').match(/^\/(ban|unban|user|note|tag|untag|to|reply)\b(?![_\s])/);
-      if (malformedAdminCmd) {
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: '命令格式不正确。\n示例：\n/ban 123456\n/unban 123456\n/user 123456\n/to 123456\n/reply 123456 你好\n/note 123456 备注\n/tag 123456 重点\n/untag 123456 重点',
-        });
-        return res.status(200).json({ ok: true });
-      }
+      const unbanCmd = txt.match(/^\/unban(?:_|\s)+(\d+)$/);
+      if (unbanCmd) { const u = await setBan(Number(unbanCmd[1]), false); await tg('sendMessage', { chat_id: ADMIN_ID, text: `已取消拉黑 ${u.id}` }); return res.status(200).json({ ok: true }); }
 
       let targetUid = null;
-      const replyCmd = (msg.text || '').match(/^\/reply(?:_|\s)+(\d+)\s+([\s\S]+)/);
+      const replyCmd = txt.match(/^\/reply(?:_|\s)+(\d+)\s+([\s\S]+)/);
       if (replyCmd) targetUid = Number(replyCmd[1]);
       if (!targetUid && msg.reply_to_message) {
-        const src = msg.reply_to_message.text || msg.reply_to_message.caption || '';
-        const m = src.match(/\[UID:(\d+)\]/);
-        if (m) targetUid = Number(m[1]);
+        const src = (msg.reply_to_message.text || msg.reply_to_message.caption || '');
+        const m = src.match(/\[UID:(\d+)\]/); if (m) targetUid = Number(m[1]);
       }
-      if (!targetUid) {
-        targetUid = await getCurrentTarget();
-      }
-      if (!targetUid) {
-        await api('sendMessage', {
-          chat_id: ADMIN_ID,
-          text: '当前没有可回复的用户。\n请先等用户发来一条消息，系统会自动切换到该用户；或者手动使用 /to_<用户ID>。',
-        });
-        return res.status(200).json({ ok: true });
-      }
+      if (!targetUid) targetUid = await getCurrentTarget();
+      if (!targetUid) { await tg('sendMessage', { chat_id: ADMIN_ID, text: '当前没有可回复用户，先等用户发消息或 /to <ID>' }); return res.status(200).json({ ok: true }); }
 
       if (msg.text && replyCmd) {
-        await api('sendMessage', { chat_id: targetUid, text: replyCmd[2] });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 已发送给 ${targetUid}` });
-        return res.status(200).json({ ok: true });
+        await tg('sendMessage', { chat_id: targetUid, text: replyCmd[2] });
+      } else if (msg.text) {
+        await tg('sendMessage', { chat_id: targetUid, text: msg.text });
+      } else if (msg.photo) {
+        const f = msg.photo[msg.photo.length - 1].file_id;
+        await tg('sendPhoto', { chat_id: targetUid, photo: f, caption: msg.caption || '' });
+      } else if (msg.video) {
+        await tg('sendVideo', { chat_id: targetUid, video: msg.video.file_id, caption: msg.caption || '' });
+      } else if (msg.document) {
+        await tg('sendDocument', { chat_id: targetUid, document: msg.document.file_id, caption: msg.caption || '' });
+      } else if (msg.audio) {
+        await tg('sendAudio', { chat_id: targetUid, audio: msg.audio.file_id, caption: msg.caption || '' });
+      } else if (msg.voice) {
+        await tg('sendVoice', { chat_id: targetUid, voice: msg.voice.file_id });
+      } else if (msg.sticker) {
+        await tg('sendSticker', { chat_id: targetUid, sticker: msg.sticker.file_id });
       }
 
-      if (msg.text) {
-        await api('sendMessage', { chat_id: targetUid, text: msg.text });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 已发送给 ${targetUid}` });
-      } else if (msg.photo) {
-        const fileId = msg.photo[msg.photo.length - 1].file_id;
-        await api('sendPhoto', { chat_id: targetUid, photo: fileId, caption: msg.caption || '' });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 图片已发送给 ${targetUid}` });
-      } else if (msg.video) {
-        await api('sendVideo', { chat_id: targetUid, video: msg.video.file_id, caption: msg.caption || '' });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 视频已发送给 ${targetUid}` });
-      } else if (msg.document) {
-        await api('sendDocument', { chat_id: targetUid, document: msg.document.file_id, caption: msg.caption || '' });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 文件已发送给 ${targetUid}` });
-      } else if (msg.audio) {
-        await api('sendAudio', { chat_id: targetUid, audio: msg.audio.file_id, caption: msg.caption || '' });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 音频已发送给 ${targetUid}` });
-      } else if (msg.voice) {
-        await api('sendVoice', { chat_id: targetUid, voice: msg.voice.file_id, caption: msg.caption || '' });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 语音已发送给 ${targetUid}` });
-      } else if (msg.sticker) {
-        await api('sendSticker', { chat_id: targetUid, sticker: msg.sticker.file_id });
-        await api('sendMessage', { chat_id: ADMIN_ID, text: `✅ 贴纸已发送给 ${targetUid}` });
-      }
+      await tg('sendMessage', { chat_id: ADMIN_ID, text: `✅ 已发送给 ${targetUid}` });
       return res.status(200).json({ ok: true });
     }
 
-    // ---------- user side ----------
-    let profile = await ensureProfile(msg.from);
-    profile = await updateProfileMessage(fromId, msg.text || msg.caption || (msg.photo ? '[图片]' : msg.video ? '[视频]' : msg.document ? '[文件]' : msg.voice ? '[语音]' : msg.audio ? '[音频]' : msg.sticker ? '[贴纸]' : '[消息]'));
+    // USER incoming
+    let p = await ensureProfile(msg.from);
+    p = await updateProfileMessage(fromId, msg.text || msg.caption || '[媒体]');
     await setCurrentTarget(fromId);
 
-    // 自动广告识别与拉黑
-    const contentForDetect = msg.text || msg.caption || '';
+    if (await isBanned(fromId)) return res.status(200).json({ ok: true, blocked: true });
 
-    // 强兜底：@账号 + 推广语义，直接拉黑
-    const hardSpam = /@[a-zA-Z0-9_]{4,}/.test(contentForDetect) && /(群发|验证|频道|引流|推广|自动处理验证|批量分发)/i.test(contentForDetect);
-    const ad = hardSpam ? { hit: true, reason: '强规则:@账号+推广语义' } : detectAdSpam(contentForDetect);
-
-    // 管理员影子提示：命中明显推广词但未达阈值（用于调参）
-    if (!ad.hit && /(群发|推广|引流|频道|自动处理验证|批量分发|代理|返佣)/i.test(contentForDetect)) {
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: `⚠️ 可疑推广（未自动拉黑）\n用户: ${profile?.username ? '@'+profile.username : profile?.nickname || fromId}\nID: ${fromId}\n内容: ${contentForDetect.slice(0, 120)}`,
-      });
-    }
+    const content = msg.text || msg.caption || '';
+    const hardSpam = /@[a-zA-Z0-9_]{4,}/.test(content) && /(群发|验证|频道|引流|推广|自动处理验证|批量分发)/i.test(content);
+    const ad = hardSpam ? { hit: true, reason: '强规则:@账号+推广语义' } : detectAdSpam(content);
     if (ad.hit) {
-      profile = await setBan(fromId, true);
-      await addTag(fromId, '自动拉黑');
-      await addTag(fromId, `命中:${ad.reason}`);
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: `🚫 已自动拉黑疑似广告用户\n用户: ${profile?.username ? '@'+profile.username : profile?.nickname || fromId}\nID: ${fromId}\n原因: ${ad.reason}\n内容: ${contentForDetect.slice(0, 120) || '[非文本媒体]'}`,
-      });
+      p = await setBan(fromId, true);
+      await tg('sendMessage', { chat_id: ADMIN_ID, text: `🚫 已自动拉黑疑似广告用户\n用户: ${profileTitle(p)}\nID: ${fromId}\n原因: ${ad.reason}\n内容: ${content.slice(0, 120) || '[非文本媒体]'}` });
       return res.status(200).json({ ok: true, auto_banned: true });
     }
 
-    if (await isBanned(fromId)) {
-      return res.status(200).json({ ok: true, blocked: true });
-    }
-
-    const title = profile.username ? `@${profile.username}` : profile.nickname;
+    const title = profileTitle(p);
     const hiddenTagHtml = `<tg-spoiler>[UID:${fromId}]</tg-spoiler>`;
 
     if (msg.text) {
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: `<b>${title}</b>\n${msg.text}\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendMessage', { chat_id: ADMIN_ID, text: `<b>${title}</b>\n${msg.text}\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.photo) {
-      const fileId = msg.photo[msg.photo.length - 1].file_id;
-      await api('sendPhoto', {
-        chat_id: ADMIN_ID,
-        photo: fileId,
-        caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      const f = msg.photo[msg.photo.length - 1].file_id;
+      await tg('sendPhoto', { chat_id: ADMIN_ID, photo: f, caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.video) {
-      await api('sendVideo', {
-        chat_id: ADMIN_ID,
-        video: msg.video.file_id,
-        caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendVideo', { chat_id: ADMIN_ID, video: msg.video.file_id, caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.document) {
-      await api('sendDocument', {
-        chat_id: ADMIN_ID,
-        document: msg.document.file_id,
-        caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendDocument', { chat_id: ADMIN_ID, document: msg.document.file_id, caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.audio) {
-      await api('sendAudio', {
-        chat_id: ADMIN_ID,
-        audio: msg.audio.file_id,
-        caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendAudio', { chat_id: ADMIN_ID, audio: msg.audio.file_id, caption: `<b>${title}</b>\n${msg.caption || ''}\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.voice) {
-      await api('sendVoice', { chat_id: ADMIN_ID, voice: msg.voice.file_id });
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: `<b>${title}</b>\n[语音消息]\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendVoice', { chat_id: ADMIN_ID, voice: msg.voice.file_id });
+      await tg('sendMessage', { chat_id: ADMIN_ID, text: `<b>${title}</b>\n[语音消息]\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     } else if (msg.sticker) {
-      await api('sendSticker', { chat_id: ADMIN_ID, sticker: msg.sticker.file_id });
-      await api('sendMessage', {
-        chat_id: ADMIN_ID,
-        text: `<b>${title}</b>\n[贴纸]\n\n${hiddenTagHtml}`,
-        parse_mode: 'HTML'
-      });
+      await tg('sendSticker', { chat_id: ADMIN_ID, sticker: msg.sticker.file_id });
+      await tg('sendMessage', { chat_id: ADMIN_ID, text: `<b>${title}</b>\n[贴纸]\n\n${hiddenTagHtml}`, parse_mode: 'HTML' });
     }
 
-    if (ECHO_MODE && !((msg.text || '').startsWith('/'))) {
-      await api('sendMessage', { chat_id: msg.chat.id, text: '✅ 已收到' });
+    if (ECHO_MODE && !(msg.text || '').startsWith('/')) {
+      await tg('sendMessage', { chat_id: msg.chat.id, text: '✅ 已收到。' });
     }
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.log('relay_error', e?.message || String(e));
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
 }
