@@ -17,7 +17,7 @@ export default async function handler(req, res) {
 
   // -------- storage layer --------
   const mem = globalThis.__relay_mem || (globalThis.__relay_mem = {
-    users: {}, recent: []
+    users: {}, recent: [], hardBans: {}
   });
 
   const hasRedis = !!(REDIS_URL && REDIS_TOKEN);
@@ -105,10 +105,33 @@ export default async function handler(req, res) {
 
   async function setBan(uid, banned) {
     const p = await getUser(uid);
-    if (!p) return null;
-    p.banned = banned;
-    await saveUser(uid, p);
-    return p;
+    const profile = p || {
+      id: Number(uid),
+      nickname: `用户${uid}`,
+      username: '',
+      first_name: '',
+      last_name: '',
+      banned: false,
+      tags: [],
+      note: '',
+      created_at: Date.now(),
+      last_seen_at: Date.now(),
+      last_message_preview: '',
+      message_count: 0,
+    };
+    profile.banned = banned;
+    profile.last_seen_at = Date.now();
+    await saveUser(uid, profile);
+    // 内存硬拉黑（fallback场景）
+    mem.hardBans[String(uid)] = !!banned;
+    return profile;
+  }
+
+  async function isBanned(uid) {
+    const u = await getUser(uid);
+    if (u?.banned) return true;
+    if (mem.hardBans[String(uid)]) return true;
+    return false;
   }
 
   async function setNote(uid, note) {
@@ -192,6 +215,12 @@ export default async function handler(req, res) {
   // -------- GET / setup --------
   if (req.method === 'GET') {
     const setup = req.query?.setup === '1' || String(req.url || '').includes('setup=1');
+    const checkUidMatch = String(req.url || '').match(/[?&](?:check_uid|uid)=(\d+)/);
+    if (checkUidMatch) {
+      const uid = Number(checkUidMatch[1]);
+      const u = await getUser(uid);
+      return res.status(200).json({ ok: true, uid, found: !!u, user: u || null, storage: hasRedis ? 'redis' : 'memory' });
+    }
     if (setup) {
       const host = req.headers['x-forwarded-host'] || req.headers.host;
       const proto = req.headers['x-forwarded-proto'] || 'https';
@@ -416,7 +445,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, auto_banned: true });
     }
 
-    if (profile?.banned) {
+    if (await isBanned(fromId)) {
       return res.status(200).json({ ok: true, blocked: true });
     }
 
