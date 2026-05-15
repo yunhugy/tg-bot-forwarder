@@ -142,6 +142,34 @@ export default async function handler(req, res) {
     return false;
   }
 
+  async function setNote(uid, note) {
+    const u = Number(uid);
+    const p = (await getUser(u)) || { id: u, nickname: `用户${u}`, username: '', first_name: '', last_name: '', banned: false, tags: [], note: '', created_at: Date.now(), last_seen_at: Date.now(), last_message_preview: '', message_count: 0 };
+    p.note = String(note || '').trim();
+    await saveUser(u, p);
+    return p;
+  }
+
+  async function addTag(uid, tag) {
+    const u = Number(uid);
+    const p = (await getUser(u)) || { id: u, nickname: `用户${u}`, username: '', first_name: '', last_name: '', banned: false, tags: [], note: '', created_at: Date.now(), last_seen_at: Date.now(), last_message_preview: '', message_count: 0 };
+    const t = String(tag || '').trim();
+    p.tags = Array.isArray(p.tags) ? p.tags : [];
+    if (t && !p.tags.includes(t)) p.tags.push(t);
+    await saveUser(u, p);
+    return p;
+  }
+
+  async function removeTag(uid, tag) {
+    const u = Number(uid);
+    const p = await getUser(u);
+    if (!p) return null;
+    const t = String(tag || '').trim();
+    p.tags = (p.tags || []).filter(x => x !== t);
+    await saveUser(u, p);
+    return p;
+  }
+
   async function setCurrentTarget(uid) {
     if (hasRedis) { await redis('SET', 'relay:admin:current_target', uid); return; }
     mem.currentTarget = Number(uid);
@@ -211,7 +239,7 @@ export default async function handler(req, res) {
     if (fromId === ADMIN_ID) {
       const txt = String(msg.text || '');
       if (txt === '/start' || txt === '/help') {
-        await tg('sendMessage', { chat_id: ADMIN_ID, text: '管理员命令:\n/users\n/current\n/to <ID>\n/ban <ID>\n/unban <ID>\n/reply <ID> 内容\n/status\n/id' });
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: '管理员命令:\n/users - 最近用户\n/current - 当前回复对象\n/to <ID> - 切换回复对象\n/reply <ID> 内容 - 指定回复\n/ban <ID> - 拉黑\n/unban <ID> - 取消拉黑\n/user <ID> - 查看资料\n/note <ID> 备注 - 设置备注\n/tag <ID> 标签 - 添加标签\n/untag <ID> 标签 - 移除标签\n/status - 状态\n/id - 管理员ID' });
         return res.status(200).json({ ok: true });
       }
       if (txt === '/id') { await tg('sendMessage', { chat_id: ADMIN_ID, text: `ADMIN_ID: ${ADMIN_ID}` }); return res.status(200).json({ ok: true }); }
@@ -241,6 +269,34 @@ export default async function handler(req, res) {
 
       const unbanCmd = txt.match(/^\/unban(?:_|\s)+(\d+)$/);
       if (unbanCmd) { const u = await setBan(Number(unbanCmd[1]), false); await tg('sendMessage', { chat_id: ADMIN_ID, text: `已取消拉黑 ${u.id}` }); return res.status(200).json({ ok: true }); }
+
+      const userCmd = txt.match(/^\/user(?:_|\s)+(\d+)$/);
+      if (userCmd) {
+        const u = await getUser(Number(userCmd[1]));
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: u ? `用户资料\n姓名: ${u.nickname}\n用户名: ${u.username || '-'}\nID: ${u.id}\n状态: ${await isBanned(u.id) ? '已拉黑' : '正常'}\n备注: ${u.note || '-'}\n标签: ${(u.tags || []).join(', ') || '-'}\n消息数: ${u.message_count || 0}\n最近: ${u.last_message_preview || '-'}` : '用户不存在' });
+        return res.status(200).json({ ok: true });
+      }
+
+      const noteCmd = txt.match(/^\/note(?:_|\s)+(\d+)\s+([\s\S]+)$/);
+      if (noteCmd) {
+        const u = await setNote(Number(noteCmd[1]), noteCmd[2]);
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: `已设置备注：${u.note}` });
+        return res.status(200).json({ ok: true });
+      }
+
+      const tagCmd = txt.match(/^\/tag(?:_|\s)+(\d+)\s+([\s\S]+)$/);
+      if (tagCmd) {
+        const u = await addTag(Number(tagCmd[1]), tagCmd[2]);
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: `已添加标签：${tagCmd[2]}` });
+        return res.status(200).json({ ok: true });
+      }
+
+      const untagCmd = txt.match(/^\/untag(?:_|\s)+(\d+)\s+([\s\S]+)$/);
+      if (untagCmd) {
+        const u = await removeTag(Number(untagCmd[1]), untagCmd[2]);
+        await tg('sendMessage', { chat_id: ADMIN_ID, text: u ? `已移除标签：${untagCmd[2]}` : '用户不存在' });
+        return res.status(200).json({ ok: true });
+      }
 
       let targetUid = null;
       const replyCmd = txt.match(/^\/reply(?:_|\s)+(\d+)\s+([\s\S]+)/);
