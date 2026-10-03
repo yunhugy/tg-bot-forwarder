@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram relay bot (polling, cloud local)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace/tg-bot-forwarder
+# 先执行：cp .env.example .env && chmod 600 .env，然后填好 TG_BOT_TOKEN
+EnvironmentFile=/home/hatch/workspace/tg-bot-forwarder/.env
+ExecStart=/usr/bin/node /home/hatch/workspace/tg-bot-forwarder/bot.js
+Restart=always
+RestartSec=5
+# 日志走 journald：journalctl -u tg-forwarder -f
+
+[Install]
+WantedBy=multi-user.target
