@@ -16,7 +16,8 @@ const tg = async (method, body) => {
 const store = createFileStore(dir);
 await store.load();
 const relay = createRelay({
-  config: { adminId: ADMIN, echoMode: true, github: null },
+  // verifyGate:false —— 本文件锁定"验证门关闭时"的中转主流程；验证门本身由 test/verify-gate-test.mjs 覆盖
+  config: { adminId: ADMIN, echoMode: true, github: null, verifyGate: false },
   store, tg,
 });
 

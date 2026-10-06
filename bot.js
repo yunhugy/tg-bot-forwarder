@@ -24,6 +24,7 @@ if (!BOT) {
 const config = {
   adminId: Number(env.ADMIN_ID || '6609386680'),
   echoMode: env.ECHO_MODE !== 'false',
+  verifyGate: env.VERIFY_NEW_USERS !== '0', // 新用户验证门，设 VERIFY_NEW_USERS=0 可关闭
   github: env.GITHUB_TOKEN
     ? {
         token: env.GITHUB_TOKEN,
